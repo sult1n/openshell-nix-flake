@@ -8,6 +8,10 @@
   gitMinimal,
   pkg-config,
   z3,
+  aws-lc,
+  sqlite,
+  zstd,
+  openssl,
 }:
 
 rustPlatform.buildRustPackage (finalAttrs: {
@@ -30,7 +34,16 @@ rustPlatform.buildRustPackage (finalAttrs: {
     rustPlatform.bindgenHook
   ];
 
-  buildInputs = [ z3 ];
+  # nixpkgs' cargoSetupHook (commit 44cddf9) forces aws-lc-sys, libsqlite3-sys,
+  # zstd-sys and openssl-sys to link against system libraries, so provide them.
+  # See https://github.com/NixOS/nixpkgs/issues/585124
+  buildInputs = [
+    z3
+    aws-lc
+    sqlite
+    zstd
+    openssl
+  ];
 
   nativeCheckInputs = [
     cacert
