@@ -6,6 +6,7 @@
   versionCheckHook,
   cacert,
   gitMinimal,
+  openssh,
   pkg-config,
   z3,
   aws-lc,
@@ -48,6 +49,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
   nativeCheckInputs = [
     cacert
     gitMinimal
+    # ssh.rs tests spawn the real `ssh` client
+    openssh
   ];
 
   postPatch = ''
@@ -57,6 +60,18 @@ rustPlatform.buildRustPackage (finalAttrs: {
     # only build openshell-cli crate
     substituteInPlace Cargo.toml \
       --replace-fail 'members = ["crates/*"]' 'members = ["crates/openshell-cli"]'
+
+    # sandbox-incompatible test fixtures:
+    # - openshell-core e2fsprogs tests generate fake mke2fs wrapper scripts
+    #   invoking /bin/sleep and /bin/dd, which don't exist in the nix build
+    #   sandbox; resolve them from PATH instead (coreutils is always there)
+    # - openshell-sandbox-backend runtime test fixtures reference /bin/true
+    #   as a program path; FHS paths don't exist in the nix build sandbox
+    substituteInPlace crates/openshell-core/src/e2fsprogs.rs \
+      --replace-fail '/bin/sleep' 'sleep' \
+      --replace-fail '/bin/dd' 'dd'
+    substituteInPlace crates/openshell-sandbox-backend/src/runtime.rs \
+      --replace-fail '"/bin/true"' '"true"'
   '';
 
   env = {
