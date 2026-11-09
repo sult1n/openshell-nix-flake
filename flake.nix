@@ -16,12 +16,12 @@
     in
     {
       overlays.default = final: prev: {
-        openshell = final.callPackage ./pkgs/openshell/package.nix { };
+        openshell = final.callPackage ./package.nix { };
       };
 
       packages = forAllSystems (
         pkgs: rec {
-          openshell = pkgs.callPackage ./pkgs/openshell/package.nix { };
+          openshell = pkgs.callPackage ./package.nix { };
           default = openshell;
         }
       );
