@@ -27,18 +27,31 @@ rustPlatform.buildRustPackage (finalAttrs: {
     hash = "sha256-mBciX4fPWUtaszWhV8gCpYjQmuAJxKxkhwT6oVKq6jY=";
   };
 
+  # cargoHash is computed by fetchCargoVendor from the PRISTINE source tree
+  # (full Cargo.lock, members = crates/*) BEFORE postPatch runs, so patching
+  # the workspace member list below does not change this hash.
   cargoHash = "sha256-4v3SuKRrEi97s4B1IDb0OCwo07/Ld4eKjgwYlXzYT+M=";
 
-  # Requires a rustc >= 1.94 (workspace `rust-version`), i.e. a nixpkgs
-  # revision from ~March 2026 onward (nixos-unstable is fine).
+  # Disable nixpkgs' cargo-auditable integration (buildRustPackage arg,
+  # on by default). Its wrapper runs `cargo metadata` for every rustc
+  # invocation, passing the features of the crate being compiled
+  # (reconstructed from `--cfg feature="..."`), and cargo applies those
+  # features to EVERY workspace member. Compiling openshell-core with the
+  # unified feature set {clap, driver-extraction, jwt, oauth, otel,
+  # telemetry} therefore fails on members that lack these public features:
+  # openshell-driver-vm has `clap` only as a `dep:`-gated optional
+  # dependency (upstream cargo issue #12336; reproduced on a minimal
+  # workspace). The manifest-level workaround would require adding six
+  # alias features to every member crate, which is not maintainable. The
+  # audit blob embedded by cargo-auditable is optional metadata; losing it
+  # does not affect functionality.
+  auditable = false;
+
   nativeBuildInputs = [
     pkg-config
     rustPlatform.bindgenHook
   ];
-
-  # nixpkgs' cargoSetupHook (commit 44cddf9) forces aws-lc-sys, libsqlite3-sys,
-  # zstd-sys and openssl-sys to link against system libraries, so provide them.
-  # See https://github.com/NixOS/nixpkgs/issues/585124
+  # nixpkgs cargoSetupHook (commit 44cddf9) forces -sys crates to system libs
   buildInputs = [
     z3
     aws-lc
@@ -47,14 +60,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     openssl
   ];
 
-  # Tools spawned by the openshell-cli test-suite:
-  # - git: run/sandbox-upload tests drive local repos in tempdirs
-  # - openssh: src/ssh.rs tests invoke the real `ssh` (e.g. `ssh -G`)
-  # - procps: without `ps` the pid-reuse assertions in the lifecycle tests
-  #   degrade to vacuous passes; keep them honest
-  # - cacert: TLS trust store
-  # coreutils (sleep/kill/printf/cp), tar (gnutar) and rustc are already on
-  # the stdenv sandbox PATH.
+  # CLI test-suite tools; procps keeps pid-reuse assertions honest
   nativeCheckInputs = [
     cacert
     gitMinimal
@@ -62,72 +68,45 @@ rustPlatform.buildRustPackage (finalAttrs: {
     procps
   ];
 
-  # Belt: scope the check to the shipped crate even if the workspace member
-  # restriction in postPatch ever stops applying. Older cargo-check-hooks
-  # simply ignore this variable - then the patches + skips below carry it.
-  cargoTestFlags = [ "-p" "openshell-cli" ];
-
-  # Suspenders: timing-sensitive solver tests that are not reliable on loaded
-  # build machines. `--skip` is passed to every test binary; binaries without
-  # these tests simply ignore the pattern.
-  checkFlags = [
-    # openshell-prover: expects two Z3 solves to finish within a shared 10 s
-    # budget before it can assert the fail-closed reason; failed twice here.
-    "--skip=containment::tests::exact_boundary_deny_under_candidate_glob_requires_image_resolution"
-    # openshell-prover-cli: asserts the child is still solving after 500 ms.
-    "--skip=sigint_interrupts_the_check_with_exit_130"
-  ];
-
   postPatch = ''
-    # fill in package version to Cargo
     substituteInPlace Cargo.toml \
       --replace-fail 'version = "0.0.0"' 'version = "${finalAttrs.version}"'
 
-    # Belt: restrict the workspace to the shipped crate. `cargo test` in a
-    # virtual workspace runs the test-suite of EVERY member, and most non-CLI
-    # crates are untestable in the Nix sandbox (audited against v0.1.7):
-    # openshell-sandbox spawns /usr/bin/env, /bin/true, /bin/sleep (~26 tests),
-    # openshell-driver-vm hardcodes PATH=/usr/bin:/bin, openshell-gateway's
-    # preflight tests fake tools with /bin/sleep, openshell-core fakes tools
-    # with /bin/sleep and /bin/dd. Patching 30+ upstream tests per release is
-    # unmaintainable; the CLI crate is the artifact this package ships.
+    # Build both shipped binaries: the CLI and the gateway server. Note that
+    # cargo auto-adds every path dependency residing in the workspace
+    # directory as a member ("All path dependencies residing in the workspace
+    # directory automatically become members", cargo book), so the effective
+    # member set is the transitive path-dep closure of these two crates:
+    # cargo build therefore also produces the standalone driver binaries
+    # (openshell-driver-{docker,kubernetes,podman,kubernetes-secrets,vault}),
+    # and cargoInstallHook copies every executable from target/release into
+    # $out/bin. Extra binaries in $out/bin are expected and harmless.
     substituteInPlace Cargo.toml \
-      --replace-fail 'members = ["crates/*"]' 'members = ["crates/openshell-cli"]'
+      --replace-fail 'members = ["crates/*"]' \
+        'members = ["crates/openshell-cli", "crates/openshell-gateway"]'
 
-    # Suspenders: if the whole workspace does get tested anyway, make every
-    # known sandbox-hostile test pass instead of failing one crate per rebuild.
-
-    # openshell-core: fake mke2fs wrappers hardcode FHS paths; the Nix sandbox
-    # has no /bin. Redirect to PATH lookups (coreutils); the timeout and
-    # process-group behaviour under test is unaffected.
+    # Inert while core tests are not run; kept for future-proofing
     substituteInPlace crates/openshell-core/src/e2fsprogs.rs \
       --replace-fail '/bin/sleep' 'sleep' \
       --replace-fail '/bin/dd' 'dd'
-
-    # openshell-sandbox: tests spawn /usr/bin/env, /bin/true and /bin/sleep.
-    substituteInPlace crates/openshell-sandbox/src/process.rs \
-      crates/openshell-sandbox/src/child_env.rs \
-      --replace-fail '/usr/bin/env' 'env'
-    substituteInPlace crates/openshell-sandbox/src/boundary_exec.rs \
-      crates/openshell-sandbox/src/boundary_server.rs \
-      --replace-fail '/bin/true' 'true' \
-      --replace-fail '/bin/sleep' 'sleep'
-    substituteInPlace crates/openshell-sandbox/src/linux/child_seccomp.rs \
-      --replace-fail '/bin/true' 'true'
-
-    # openshell-gateway: preflight tests fake tools with /bin/sleep.
-    substituteInPlace crates/openshell-gateway/tests/config_preflight.rs \
-      --replace-fail '/bin/sleep' 'sleep'
-
-    # openshell-driver-vm: two overlay tests run the driver with
-    # PATH=/usr/bin:/bin and expect the real `cp` to be there. Point them at
-    # the build PATH (expanded in the sandbox, where coreutils lives).
-    substituteInPlace crates/openshell-driver-vm/tests/image_preparation.rs \
-      --replace-fail '/usr/bin:/bin' "$PATH"
   '';
 
+  # Tests: run ONLY the CLI crate. nixpkgs' cargoCheckHook passes
+  # cargoTestFlags before the `--` separator, so `-p` is parsed by cargo
+  # itself (checkFlags would land after `--` as test-executable args and
+  # break). Without -p, `cargo test` in a virtual workspace tests every
+  # workspace member, and the path-dep closure (see the members comment
+  # above) includes crates whose suites are untestable in the Nix sandbox
+  # (audited v0.1.7):
+  #  - openshell-sandbox: ~26 tests spawn /usr/bin/env, /bin/true, /bin/sleep
+  #  - openshell-driver-vm: hardcoded PATH=/usr/bin:/bin, needs real cp
+  #  - openshell-gateway: preflight tests fake tools with /bin/sleep
+  #  - openshell-core: e2fsprogs tests fake tools with /bin/sleep, /bin/dd
+  #  - openshell-prover: Z3 solver test with shared 10 s budget, timing-flaky
+  # This makes checkPhase deterministic instead of passing by luck.
+  cargoTestFlags = [ "-p" "openshell-cli" ];
+
   env = {
-    # docker image tag baked in at compile time, must match binary version
     OPENSHELL_IMAGE_TAG = finalAttrs.version;
   };
 
@@ -142,11 +121,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
     homepage = "https://docs.nvidia.com/openshell/index.html";
     license = lib.licenses.asl20;
     longDescription = ''
-      NVIDIA OpenShell is an open source runtime to build and deploy autonomous,
-      self-evolving agents more safely. OpenShell sits between your agent and
-      your infrastructure to govern how the agent executes, what the agent can
-      see and do, and where inference goes. It enables claws to run in isolated
-      sandboxes, with fine-grained control over privacy and security.
+      NVIDIA OpenShell is the safe, private runtime for autonomous AI agents.
+      It runs coding agents in isolated sandbox environments on the user's own
+      infrastructure with policy-controlled filesystem, network and credential
+      access. This package provides the `openshell` CLI and the
+      `openshell-gateway` server binary for hosting sandboxes natively, e.g.
+      with the rootless Podman compute driver.
     '';
     maintainers = with lib.maintainers; [ wishstudio ];
     mainProgram = "openshell";
